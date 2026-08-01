@@ -11,6 +11,15 @@ if (process.env.CI) {
 
 export default defineDesktopProject({
   plugins: [tailwindcss(), playwrightCommands()],
+  // Dev-mode module conditions would pick loro-crdt's `bundler` build, whose
+  // raw `.wasm` import Vite can't serve; the `browser` build self-loads its
+  // wasm relative to `import.meta.url`, which also rules out esbuild
+  // prebundling relocating it (same story as @sqlite.org/sqlite-wasm). Only
+  // loro-crdt is excluded: excluding loro-prosemirror too would give it a
+  // source-served prosemirror-state while the editor uses the prebundled
+  // copy — two Plugin classes, and ProseKit's `instanceof` checks fail.
+  alias: { 'loro-crdt': 'loro-crdt/browser' },
+  optimizeDeps: { exclude: ['loro-crdt'] },
   test: {
     name: 'browser',
     include: ['src/**/*.test.tsx'],

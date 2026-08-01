@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useRef, useState, type ReactElement } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import type { ExitBoundaryHandler, SearchStatus } from '@meowdown/core'
 import {
   detectConflictMarkers,
@@ -16,6 +16,9 @@ import { SuggestedContactCard } from '@/components/suggested-contact-card'
 import { SyncConflictNotice } from '@/components/sync-conflict-notice'
 import { EditorAiKeymap } from '@/editor/ai-menu/editor-ai-keymap'
 import { useEditorAiMenu } from '@/editor/ai-menu/use-editor-ai-menu'
+import { CollabIndicator } from '@/editor/collab/collab-indicator'
+import { CollabPlugin } from '@/editor/collab/collab-plugin'
+import { useCollabSession } from '@/editor/collab/use-collab-session'
 import { editorBodyWithDefaultBullet } from '@/editor/default-bullet'
 import {
   registerNoteEditorHandle,
@@ -26,6 +29,7 @@ import { NoteEditor, type NoteEditorHandle } from '@/editor/note-editor'
 import { resolveAssetFileLink, useAssetPersistence } from '@/editor/use-asset-persistence'
 import { useEditorAutocomplete } from '@/editor/use-editor-autocomplete'
 import { useNoteDocument } from '@/editor/use-note-document'
+import type { NoteSessionCollabState } from '@/editor/note-session'
 import { useTagNavigation } from '@/editor/use-tag-navigation'
 import { useTemplateSlashItems } from '@/editor/use-template-slash-items'
 import { useMarkdownLinkNavigation } from '@/editor/use-markdown-link-navigation'
@@ -36,6 +40,9 @@ import { cn } from '@/lib/utils'
 import { useGraph } from '@/providers/graph-provider'
 import { useNoteSearchQuery, useNoteSearchReport } from '@/providers/note-find-provider'
 import { useSettings } from '@/providers/settings-provider'
+
+/** Long enough for resume catch-up responses to import before the flush. */
+const RESUME_FLUSH_DELAY_MS = 1000
 
 interface NotePaneProps {
   /** Graph-relative path of the note to edit. */
@@ -150,6 +157,14 @@ export function NotePaneComponent({
   if (needsSeed && seed.path !== path) {
     setSeed({ path, seed: untitledNoteSeed() })
   }
+  // Probed by the session at decision points — a render-written ref, like
+  // use-note-document's generationRef, so it never lags a render.
+  const collabStateRef = useRef<NoteSessionCollabState>({ paused: false, sharedFile: false })
+  const collabState = useCallback(() => collabStateRef.current, [])
+  // Final flushes publish a paused pane's unshared ops before its buffer
+  // reaches disk, so peers merge instead of adopting a divergent file.
+  const collabPublishPendingRef = useRef<(() => void) | null>(null)
+  const onBeforeFinalFlush = useCallback(() => collabPublishPendingRef.current?.(), [])
   const document = useNoteDocument(path, generation, {
     createIfMissing: lazyCreate,
     // Every editable regular note maintains title-addressed links and
@@ -162,7 +177,67 @@ export function NotePaneComponent({
     // reaches disk if the user edits, and typing names the note. Daily
     // notes stay unseeded — the date is their identity.
     ...(needsSeed ? { missingSeed: seed.seed } : {}),
+    collabState,
+    onBeforeFinalFlush,
   })
+  // A note that opens with an empty body starts on an empty bullet when the
+  // setting is on (old Reflect's every-note default). The seed only changes
+  // what the editor shows; persistence is untouched — see `default-bullet.ts`.
+  // The collab session seeds its shared document from exactly this.
+  const editorSeed = editorBodyWithDefaultBullet(
+    document.initialContent,
+    settings.editorDefaultBullet,
+  )
+
+  // The collab key is pinned per note session, not per path prop: a rename
+  // retargets the live session (Plan 17) and every window follows in place,
+  // so re-keying would tear the shared epoch down mid-thought; a real note
+  // switch bumps the session epoch and re-pins.
+  const liveCollabKey =
+    document.status === 'ready' && !document.protected && graph !== null
+      ? `${graph.root}\n${path}`
+      : null
+  const [pinnedCollab, setPinnedCollab] = useState<{ epoch: number; key: string | null }>({
+    epoch: document.sessionEpoch,
+    key: liveCollabKey,
+  })
+  if (
+    pinnedCollab.epoch !== document.sessionEpoch ||
+    (pinnedCollab.key === null) !== (liveCollabKey === null)
+  ) {
+    // Eligibility flips re-pin in both directions: a note that turns
+    // protected mid-session must leave its epoch, not keep serving it.
+    setPinnedCollab({ epoch: document.sessionEpoch, key: liveCollabKey })
+  }
+  const collab = useCollabSession(pinnedCollab.key, pinnedCollab.key !== null ? editorSeed : null)
+  // eslint-disable-next-line react-hooks/refs
+  collabStateRef.current = {
+    paused: collab.mode === 'paused',
+    sharedFile: collab.status === 'ready' && collab.mode === 'live' && collab.peers > 0,
+  }
+  // eslint-disable-next-line react-hooks/refs
+  collabPublishPendingRef.current = collab.publishPending
+  // Resume flushes after a beat: the synchronous mode change only *requests*
+  // catch-up, and an immediate flush would write the pre-merge buffer. The
+  // delayed flush also covers the no-remote-changes case, where nothing else
+  // would land the un-paused buffer.
+  const documentFlush = document.flush
+  const prevCollabModeRef = useRef(collab.mode)
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    if (prevCollabModeRef.current === 'paused' && collab.mode === 'live') {
+      timer = setTimeout(() => {
+        documentFlush()
+      }, RESUME_FLUSH_DELAY_MS)
+    }
+    prevCollabModeRef.current = collab.mode
+    return () => {
+      if (timer !== null) {
+        clearTimeout(timer)
+      }
+    }
+  }, [collab.mode, documentFlush])
+
   const { resolveImageUrl, resolveAssetOpenPath, openAsset, saveFile, resolveFileInfo, saveError } =
     useAssetPersistence(generation, path)
   const renderWikilinkHoverCard = useWikiLinkHoverPreview({
@@ -295,15 +370,6 @@ export function NotePaneComponent({
     )
   }
 
-  // A note that opens with an empty body starts on an empty bullet when the
-  // setting is on (old Reflect's every-note default). The seed only changes what
-  // the editor shows; persistence is untouched, so a not-yet-created daily
-  // placeholder stays uncreated until the user types — see `default-bullet.ts`.
-  const editorSeed = editorBodyWithDefaultBullet(
-    document.initialContent,
-    settings.editorDefaultBullet,
-  )
-
   return (
     <div className={cn('relative', className)} aria-label={`Editing ${path}`}>
       <div className={gutterClassName}>
@@ -325,6 +391,14 @@ export function NotePaneComponent({
           <NoteConflictBanner onKeepMine={document.keepMine} onLoadTheirs={document.loadTheirs} />
         ) : null}
 
+        <CollabIndicator
+          peers={collab.peers}
+          mode={collab.mode}
+          onModeChange={collab.setMode}
+          note={collab.unavailableReason}
+          className="mb-2"
+        />
+
         <SyncConflictNotice path={path} className="mb-4" />
 
         {/* Daily notes are date-titled, so a contact can never match one —
@@ -343,6 +417,11 @@ export function NotePaneComponent({
         onChange={document.onEditorChange}
         markMode={markModeFromSyntax(settings.editorMarkdownSyntax)}
         spellCheck={settings.editorSpellCheck}
+        // Content paints immediately, but typing waits for the shared doc:
+        // the Loro attach replaces the surface, and keystrokes landing
+        // before it would be wiped. One local IPC round trip; `unavailable`
+        // degrades to plain solo editing.
+        readOnly={pinnedCollab.key !== null && collab.status === 'starting'}
         searchQuery={searchQuery}
         onSearchChange={handleSearchChange}
         smoothCaretAnimation={settings.editorSmoothCaretAnimation}
@@ -382,6 +461,9 @@ export function NotePaneComponent({
         onExitBoundary={handleExitBoundary}
       >
         <EditorAiKeymap onTrigger={aiMenu.openMenu} />
+        {collab.doc !== null && collab.presence !== null && collab.memberId !== null ? (
+          <CollabPlugin doc={collab.doc} presence={collab.presence} memberId={collab.memberId} />
+        ) : null}
       </NoteEditor>
 
       {showBacklinks ? (

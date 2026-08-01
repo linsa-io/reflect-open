@@ -1,0 +1,44 @@
+diff --git a/dist/index.cjs b/dist/index.cjs
+index 74c4b30c8be44a01bfa974046502af2de912f667..7efee5c7158a37b800f622b585ca7f5f57dac468 100644
+--- a/dist/index.cjs
++++ b/dist/index.cjs
+@@ -226,7 +226,7 @@ function updateLoroMapAttributes(obj, node, _mapping) {
+ 	for (const [key, value] of Object.entries(pAttrs)) {
+ 		if (value !== null) {
+ 			if (!(0, lib0_function.equalityDeep)(attrs.get(key), value)) attrs.set(key, value);
+-		} else attrs.delete(key);
++		} else if (attrs.get(key) !== void 0) attrs.delete(key);
+ 		keys.delete(key);
+ 	}
+ 	for (const key of keys) attrs.delete(key);
+@@ -573,7 +573,7 @@ const LoroSyncPlugin = (props) => {
+ 				else state.changedBy = "local";
+ 				switch (meta?.type) {
+ 					case "doc-changed":
+-						if (!undoState?.isUndoing.current) updateLoroToPmState(state.doc, state.mapping, newEditorState, props.containerId);
++						if (state.docSubscription != null && !undoState?.isUndoing.current) updateLoroToPmState(state.doc, state.mapping, newEditorState, props.containerId);
+ 						break;
+ 					case "update-state":
+ 						state = {
+diff --git a/dist/index.js b/dist/index.js
+index e41095d5b08a1fdebb48143beceb7fe93aa20565..f2c4eda4a6e53a61d39119cdd3726b058896516f 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -225,7 +225,7 @@ function updateLoroMapAttributes(obj, node, _mapping) {
+ 	for (const [key, value] of Object.entries(pAttrs)) {
+ 		if (value !== null) {
+ 			if (!equalityDeep(attrs.get(key), value)) attrs.set(key, value);
+-		} else attrs.delete(key);
++		} else if (attrs.get(key) !== void 0) attrs.delete(key);
+ 		keys.delete(key);
+ 	}
+ 	for (const key of keys) attrs.delete(key);
+@@ -572,7 +572,7 @@ const LoroSyncPlugin = (props) => {
+ 				else state.changedBy = "local";
+ 				switch (meta?.type) {
+ 					case "doc-changed":
+-						if (!undoState?.isUndoing.current) updateLoroToPmState(state.doc, state.mapping, newEditorState, props.containerId);
++						if (state.docSubscription != null && !undoState?.isUndoing.current) updateLoroToPmState(state.doc, state.mapping, newEditorState, props.containerId);
+ 						break;
+ 					case "update-state":
+ 						state = {

@@ -113,6 +113,12 @@ interface NoteEditorProps {
   markMode?: MarkMode
   /** Whether the browser underlines misspelled words (default on). */
   spellCheck?: boolean
+  /**
+   * Makes the editor read-only (dynamic). The collab pane uses this for the
+   * brief beat between mount and the shared document's arrival, so
+   * keystrokes can't land in a surface the sync attach is about to replace.
+   */
+  readOnly?: boolean
   /** Whether the caret animates between positions (default on). */
   smoothCaretAnimation?: boolean
   /**
@@ -229,6 +235,7 @@ export function NoteEditor({
   onChange,
   markMode = 'hide',
   spellCheck = true,
+  readOnly = false,
   smoothCaretAnimation = true,
   timeFormat = '12h',
   bulletAfterHeading = false,
@@ -428,6 +435,7 @@ export function NoteEditor({
         handleRef={innerRef}
         mode={markMode}
         initialMarkdown={initialContent}
+        readOnly={readOnly}
         // On the touch surface spellcheck is pinned off regardless of the
         // setting: iOS derives the keyboard's smart-quotes/smart-dashes traits
         // from it at focus time, and smart punctuation corrupts markdown

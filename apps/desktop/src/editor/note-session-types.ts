@@ -104,6 +104,27 @@ export interface NoteSessionOptions {
    */
   missingSeed?: string | undefined
   saveDebounceMs?: number
+  /**
+   * The pane's collaborative-editing state, probed at decision points:
+   * **paused** suspends saves and ignores external changes (the divergence
+   * is deliberate; resuming merges); **sharedFile** defers a mismatching
+   * external change briefly instead of parking (disk legitimately lags the
+   * converged buffer by a save debounce). Absent means solo semantics.
+   */
+  collabState?: (() => NoteSessionCollabState) | undefined
+  /**
+   * Runs at the start of every **final** flush, before the write dispatches:
+   * the collab layer hands a paused pane's unshared ops to the epoch here.
+   */
+  onBeforeFinalFlush?: (() => void) | undefined
+}
+
+/** See {@link NoteSessionOptions.collabState}. */
+export interface NoteSessionCollabState {
+  /** This pane's sync toggle is off; its buffer diverges by design. */
+  paused: boolean
+  /** Live with peers: other panes converge — and save — this same file. */
+  sharedFile: boolean
 }
 /** One open note's document lifecycle. Create via {@link createNoteSession}. */
 export interface NoteSession {
@@ -128,7 +149,7 @@ export interface NoteSession {
    * flushed write has settled — quit-time teardown awaits this so the webview
    * can't die before the bytes land.
    */
-  flush: () => Promise<void>
+  flush: (options?: { final?: boolean }) => Promise<void>
   /** Resolve a conflict by keeping the buffer (rewrites the file). */
   keepMine: () => void
   /** Resolve a conflict by loading the external content (discards the buffer). */

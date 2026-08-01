@@ -21,3 +21,6 @@ minimumReleaseAgeExclude:
   - '@prosemirror-adapter/*'
   - prosemirror-flat-list
   - prosemirror-view
+
+patchedDependencies:
+  loro-prosemirror@0.4.3: patches/loro-prosemirror@0.4.3.patch

@@ -36,6 +36,7 @@ and MIT-licensed, so there is no copyleft constraint.
 | Diff / patch (patchsets, conflict diffs) | Not installed; patchsets remain deferred | 10 / 12 |
 | Chrome extension framework | WXT | 11 |
 | Auto-update (JS API + relaunch) | `@tauri-apps/plugin-updater` + `@tauri-apps/plugin-process` | 15 |
+| Collaborative text (CRDT engine + PM binding) | `loro-crdt` + `loro-prosemirror` + `@prosekit/extensions`/`@prosekit/core` (pinned to meowdown's versions) | [collaborative-editing.md](../collaborative-editing.md) |
 
 ## Rust crates (additions by plan)
 

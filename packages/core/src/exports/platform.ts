@@ -275,3 +275,15 @@ export {
   type PersonContactResolution,
   type PersonResolution,
 } from '../contacts/person'
+export {
+  COLLAB_MEMBERS_EVENT,
+  COLLAB_MESSAGE_EVENT,
+  collabJoin,
+  collabLeave,
+  collabPublish,
+  subscribeCollabMembers,
+  subscribeCollabMessages,
+  type CollabJoinResult,
+  type CollabMembers,
+  type CollabMessage,
+} from '../collab/commands'

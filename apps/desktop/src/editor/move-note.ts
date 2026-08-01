@@ -31,7 +31,9 @@ export async function moveNoteCarryingSession(
 ): Promise<void> {
   const owner = openSession(from)
   if (owner !== null) {
-    await owner.flush()
+    // Final: the buffer must be on disk before the file moves — a held save
+    // (collab pause) surviving the move would later recreate the old path.
+    await owner.flush({ final: true })
     owner.retarget(to)
     retargetOpenDocument(from, to, owner)
   }

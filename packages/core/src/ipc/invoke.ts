@@ -1,6 +1,9 @@
-import type { ZodType } from 'zod'
+import { z, type ZodType } from 'zod'
 import { toAppError, type AppError } from '../errors'
 import { getBridge } from './bridge'
+
+/** Response validator for commands that return nothing (Rust `AppResult<()>`). */
+export const voidResponseSchema = z.null()
 
 /**
  * The single boundary where an untyped native IPC response becomes a typed,

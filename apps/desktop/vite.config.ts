@@ -38,6 +38,10 @@ export default defineConfig(async () => ({
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),
+      // Pin loro-crdt to its self-loading `browser` build: the dev-mode
+      // `development` condition would otherwise pick the `bundler` build,
+      // whose raw `.wasm` import Vite can't serve (see optimizeDeps below).
+      'loro-crdt': 'loro-crdt/browser',
     },
   },
 
@@ -47,9 +51,14 @@ export default defineConfig(async () => ({
 
   // The dev bridge's SQLite (dev-only, behind `?platform=ios`) locates its
   // .wasm relative to its own module URL; esbuild pre-bundling would relocate
-  // the module into .vite/deps and break that lookup.
+  // the module into .vite/deps and break that lookup. loro-crdt's `browser`
+  // build (pinned via the alias above — the dev-condition `bundler` build's
+  // raw `.wasm` import doesn't work under Vite) resolves its wasm the same
+  // way, so it stays out too. loro-prosemirror must NOT be excluded: it
+  // would then load a source-served prosemirror-state while the editor uses
+  // the prebundled copy — two Plugin classes, failing ProseKit's checks.
   optimizeDeps: {
-    exclude: ['@sqlite.org/sqlite-wasm'],
+    exclude: ['@sqlite.org/sqlite-wasm', 'loro-crdt'],
   },
 
   // Vite options tailored for Tauri development, applied in `tauri dev`/`tauri build`.

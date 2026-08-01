@@ -13,16 +13,25 @@ import { splitDoc } from './note-session-doc'
 import { frontmatterPatchToYaml, type FrontmatterPatch } from './note-session-frontmatter'
 import type {
   NoteSession,
+  NoteSessionCollabState,
   NoteSessionOptions,
   NoteSessionSnapshot,
   NoteSessionStatus,
 } from './note-session-types'
 
 const DEFAULT_SAVE_DEBOUNCE_MS = 800
+/** How long a collab-shared mismatch may lag before it counts as external. */
+const COLLAB_RECHECK_MS = 400
+/** A moving buffer earns extra beats, but the verdict can't defer forever. */
+const MAX_RECHECK_DEFERS = 3
+
+const SOLO_COLLAB: NoteSessionCollabState = { paused: false, sharedFile: false }
 
 /** Create the document session for one note. See note-session.ts for semantics. */
 export function createNoteSession(options: NoteSessionOptions): NoteSession {
   const { io, classify, onSnapshot, applyContent, onContent, reconcilePendingEditorInput } = options
+  const collab = options.collabState ?? ((): NoteSessionCollabState => SOLO_COLLAB)
+  const onBeforeFinalFlush = options.onBeforeFinalFlush
   /** Mutable: a rename retargets the session in place (Plan 17). */
   let path = options.path
   const createIfMissing = options.createIfMissing ?? false
@@ -46,6 +55,20 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
   /** The full content most recently read from or written to disk. */
   let disk = ''
   let saveTimer: ReturnType<typeof setTimeout> | null = null
+  /** Pending collab-shared reconcile re-check timer (see `scheduleCollabRecheck`). */
+  let recheckTimer: ReturnType<typeof setTimeout> | null = null
+  /**
+   * True from mismatch-under-investigation until its verdict — spanning the
+   * async re-read, not just the timer, so no save can slip into the gap.
+   * Conflict-like: blocks even final flushes.
+   */
+  let recheckPending = false
+  /** Invalidates in-flight re-checks when the user resolves the mismatch. */
+  let recheckGeneration = 0
+  /** Consecutive re-defers; a moving buffer can't postpone the verdict forever. */
+  let recheckAttempts = 0
+  /** External content seen while paused — settled before the next write. */
+  let pausedExternal: string | null = null
   /** Serializes writes so a flush can't interleave with a debounced save. */
   let saveChain: Promise<void> = Promise.resolve()
   /**
@@ -97,14 +120,29 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
     onSnapshot(next)
   }
 
-  function save(): void {
-    // A discarded session never writes: its file is being deleted, so any
-    // save — including a teardown `flush()` (the pane unmounts via flush →
-    // dispose) or an already-queued step — would recreate it. A parked
-    // conflict likewise pauses all saves: writing the buffer before the user
-    // chooses Keep mine / Load theirs would clobber the external change and
-    // defeat the non-destructive flow.
-    if (discarded || io.write === null || !dirty || isProtected || conflict !== null) {
+  /**
+   * Discarded sessions never write (the file is being deleted); a parked
+   * conflict and a pending re-check hold saves (writing would clobber the
+   * external side before the user/verdict decides); a collab-paused pane
+   * holds them too (disk belongs to the live peers). A **final** flush
+   * (teardown, quit, note move) overrides the pause gate only.
+   */
+  function saveBlocked(final: boolean): boolean {
+    return (
+      discarded ||
+      !dirty ||
+      isProtected ||
+      conflict !== null ||
+      recheckPending ||
+      (collab().paused && !final)
+    )
+  }
+
+  function save(final = false): void {
+    if (pausedExternal !== null && (final || !collab().paused)) {
+      settlePausedExternal()
+    }
+    if (io.write === null || saveBlocked(final)) {
       return
     }
     const write = io.write
@@ -112,10 +150,10 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
       .then(async () => {
         // Re-check at execution time and take the freshest buffer — a queued
         // step can run behind a slow prior write, during which the user may
-        // have reverted or kept typing, or the session may have been discarded
-        // for a delete. (After dispose the buffer is frozen, so this same step
-        // doubles as the final flush.)
-        if (discarded || !dirty || isProtected || conflict !== null) {
+        // have reverted or kept typing, paused sync, or the session may have
+        // been discarded for a delete. (After dispose the buffer is frozen,
+        // so this same step doubles as the final flush.)
+        if (saveBlocked(final)) {
           return
         }
         const content = header + buffer
@@ -140,6 +178,9 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
   }
 
   function scheduleSave(): void {
+    if (collab().paused) {
+      return // resuming (or the teardown flush) restarts persistence
+    }
     if (saveTimer !== null) {
       clearTimeout(saveTimer)
     }
@@ -156,10 +197,16 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
     }
   }
 
-  function flush(): Promise<void> {
+  function flush(options?: { final?: boolean }): Promise<void> {
+    const final = options?.final ?? false
     reconcilePendingEditorInput?.()
     cancelScheduledSave()
-    save()
+    if (final) {
+      // Unshared collab ops must reach the epoch before the buffer reaches
+      // disk, so peers merge instead of adopting a divergent file.
+      onBeforeFinalFlush?.()
+    }
+    save(final)
     // save() extended the chain synchronously (or left it settled when there
     // was nothing to do) — the chain as of now is exactly this flush's write.
     return saveChain
@@ -205,6 +252,7 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
 
   /** Adopt `content` as the new clean document state, re-gating protection. */
   function adoptCleanContent(content: string): void {
+    pausedExternal = null
     const doc = splitDoc(content)
     header = doc.header
     buffer = doc.body
@@ -225,6 +273,35 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
       applyToEditor(doc.body)
     }
     onContent?.(content, 'external')
+  }
+
+  /**
+   * External content equal to the live document byte-for-byte (typically a
+   * peer's save of converged content): adopt the bookkeeping silently —
+   * applying identical content would re-enter the collab doc as a spurious
+   * whole-document op — and clear a park whose disagreement no longer exists.
+   */
+  function adoptEqualContent(content: string): void {
+    cancelScheduledSave()
+    cancelRecheck()
+    pausedExternal = null
+    disk = content
+    dirty = false
+    missing = false
+    conflict = null
+    emit()
+    onContent?.(content, 'external')
+  }
+
+  /** Resolve any pending re-check: verdict delivered or superseded. */
+  function cancelRecheck(): void {
+    recheckGeneration += 1
+    recheckPending = false
+    recheckAttempts = 0
+    if (recheckTimer !== null) {
+      clearTimeout(recheckTimer)
+      recheckTimer = null
+    }
   }
 
   /**
@@ -252,7 +329,28 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
       }
       return
     }
+    if (content === header + buffer) {
+      adoptEqualContent(content)
+      return
+    }
+    const collabState = collab()
+    if (collabState.paused) {
+      // The divergence is deliberate: applying disk would smuggle peers'
+      // edits in as local ops, and parking would cry wolf. Remember the
+      // content instead — it must be settled before this pane writes again,
+      // or a genuinely-external change dies under the stale buffer.
+      pausedExternal = content
+      return
+    }
+    pausedExternal = null
     if (dirty) {
+      if (collabState.sharedFile) {
+        // Live collab: disk legitimately lags the converged buffer by a save
+        // debounce, so give convergence one beat before treating the
+        // mismatch as a real external edit.
+        scheduleCollabRecheck()
+        return
+      }
       // Never clobber unsaved edits — park the external content and pause the
       // save pipeline (cancel any pending debounce) until the user chooses; a
       // save landing now would overwrite "theirs" first.
@@ -262,6 +360,100 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
       return
     }
     adoptCleanContent(content)
+  }
+
+  /**
+   * The deferred second look for a collab-shared mismatch. Equality adopts;
+   * a moving buffer re-defers a bounded number of times; a mismatch that
+   * survives parks like the solo path. A user resolution bumps the
+   * generation so the stale continuation drops itself; one timer collapses
+   * repeated watcher events.
+   */
+  function scheduleCollabRecheck(): void {
+    // Before the collapse guard: an armed timer already implies an
+    // investigation, and the save gate must hold for its whole span.
+    recheckPending = true
+    if (recheckTimer !== null) {
+      return
+    }
+    const bufferAtDefer = buffer
+    const generation = recheckGeneration
+    // The debounce timer would only fire into the held gate and get lost.
+    cancelScheduledSave()
+    recheckTimer = setTimeout(() => {
+      recheckTimer = null
+      void (async () => {
+        let content: string | null
+        try {
+          content = await io.read(path)
+        } catch {
+          content = null
+        }
+        if (disposed || generation !== recheckGeneration) {
+          return
+        }
+        if (content === null || content === disk || content === inFlightWrite) {
+          resolveRecheckClean()
+          return
+        }
+        if (content === header + buffer) {
+          adoptEqualContent(content)
+          return
+        }
+        if (collab().paused) {
+          pausedExternal = content // settled before the next write
+          resolveRecheckClean()
+          return
+        }
+        if (!dirty) {
+          cancelRecheck()
+          adoptCleanContent(content)
+          return
+        }
+        if (buffer !== bufferAtDefer && recheckAttempts < MAX_RECHECK_DEFERS) {
+          recheckAttempts += 1
+          recheckPending = false
+          scheduleCollabRecheck()
+          return
+        }
+        cancelRecheck()
+        cancelScheduledSave()
+        conflict = content
+        emit()
+      })()
+    }, COLLAB_RECHECK_MS)
+  }
+
+  /** The investigated mismatch evaporated — release held saves. */
+  function resolveRecheckClean(): void {
+    cancelRecheck()
+    if (dirty && conflict === null && !collab().paused) {
+      scheduleSave()
+    }
+  }
+
+  /**
+   * Settle external content that arrived while paused, before any write:
+   * equal content adopts, a clean buffer reloads, a dirty one parks — never
+   * a silent overwrite.
+   */
+  function settlePausedExternal(): void {
+    const external = pausedExternal
+    pausedExternal = null
+    if (external === null || external === disk) {
+      return
+    }
+    if (external === header + buffer) {
+      adoptEqualContent(external)
+      return
+    }
+    if (!dirty) {
+      adoptCleanContent(external)
+      return
+    }
+    cancelScheduledSave()
+    conflict = external
+    emit()
   }
 
   /** The initial read; with `createIfMissing`, a missing file is an empty note. */
@@ -340,16 +532,20 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
   }
 
   function keepMine(): void {
+    // The user's verdict supersedes any in-flight re-check, which would
+    // otherwise re-park the conflict and swallow this write.
+    cancelRecheck()
     conflict = null
     dirty = true // force the rewrite even if content drifted equal
     emit()
-    save()
+    save(true)
   }
 
   function loadTheirs(): void {
     if (conflict === null) {
       return
     }
+    cancelRecheck() // same verdict-supersedes-investigation rule as keepMine
     const content = conflict
     conflict = null
     // Same re-gating as the clean-reload path: never load lossy content into a
@@ -375,7 +571,8 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
     // say so, rather than riding `updateFrontmatter`'s in-memory success while
     // `save()` silently no-ops. A `true` here would let publish/pin/private
     // skip their disk fallback and treat an unwritten flag as persisted.
-    if (io.write === null) {
+    // Held saves (collab pause, pending re-check) refuse for the same reason.
+    if (io.write === null || collab().paused || recheckPending) {
       return false
     }
     if (!updateFrontmatter(patch)) {
@@ -414,7 +611,15 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
    * can't diverge, then re-throws the failure.
    */
   async function commitBodyEdit(transform: (full: string) => string): Promise<boolean> {
-    if (io.write === null || disposed || isProtected || status !== 'ready' || conflict !== null) {
+    if (
+      io.write === null ||
+      disposed ||
+      isProtected ||
+      status !== 'ready' ||
+      conflict !== null ||
+      collab().paused ||
+      recheckPending
+    ) {
       return false
     }
     const previousHeader = header
@@ -470,16 +675,23 @@ export function createNoteSession(options: NoteSessionOptions): NoteSession {
   function dispose(): void {
     // A discarded session must not write: its file is being deleted, and a
     // flush would recreate it. Otherwise flush first — the queued save step
-    // reads the (now frozen) buffer, so pending edits persist to this
-    // session's path even after the UI moves on.
+    // reads the (now frozen) buffer, so pending edits persist even after the
+    // UI moves on. Final: lifts the pause gate, while an unresolved re-check
+    // keeps blocking (the external side wins at teardown, like a parked
+    // conflict) — only the timer is cleared, `recheckPending` stays set.
+    if (recheckTimer !== null) {
+      clearTimeout(recheckTimer)
+      recheckTimer = null
+    }
     if (!discarded) {
-      void flush()
+      void flush({ final: true })
     }
     disposed = true
   }
 
   function discard(): void {
     cancelScheduledSave()
+    cancelRecheck()
     discarded = true
     disposed = true
   }

@@ -181,26 +181,24 @@ describe('createNoteSession', () => {
     expect(snapshots.length).toBe(afterLoad + 1) // one dirty transition, not two
   })
 
-  it('keepMine rewrites the file even when the conflict content equals the buffer', async () => {
-    const { session, writes, snapshots, setDisk } = harness()
+  it('adopts identical external content instead of parking a conflict', async () => {
+    const { session, writes, snapshots, applied, setDisk } = harness()
     session.load()
     await settled()
 
-    // The user types X while the same X lands on disk externally (e.g. another
-    // device synced the identical edit). The external content parks as a
-    // conflict; "keep mine" must still persist deterministically.
+    // The user types X while the same X lands on disk externally (another
+    // device synced the identical edit, or a collab peer saved the converged
+    // buffer). There is nothing to choose between — byte-identical content
+    // adopts silently (equality adoption), the buffer counts as
+    // saved, and the editor is never touched.
     session.editorChanged('# Same on both\n')
     setDisk('# Same on both\n')
     session.externalChanged()
     await settled()
-    expect(snapshots.at(-1)?.conflict).toBe('# Same on both\n')
-    expect(writes).toEqual([]) // parked conflict paused the debounced save
-
-    session.keepMine()
-    await settled()
-    expect(writes).toEqual([{ path: 'notes/a.md', contents: '# Same on both\n' }])
     expect(snapshots.at(-1)?.conflict).toBeNull()
     expect(snapshots.at(-1)?.dirty).toBe(false)
+    expect(applied).toEqual([]) // identical content never re-enters the editor
+    expect(writes).toEqual([]) // nothing left to write — disk already agrees
   })
 
   it('re-gates protection when external content stops being representable', async () => {

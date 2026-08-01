@@ -81,7 +81,11 @@ export function createDocumentBinding(): DocumentBinding {
     // the note-switch "final flush". The flush's landed save reaches the
     // rename tracker via onContent('saved'); settle after it so a just-edited
     // title still renames on the way out.
-    const settled = target.flush()
+    // Final: this is the pane's last flush — it must land a collab-paused
+    // buffer, and `settled` must cover the write that actually happens so
+    // settle-time rename work orders after it (dispose()'s own flush then
+    // finds nothing left to do).
+    const settled = target.flush({ final: true })
     // `flush()` may synchronously report reconciled editor input through the
     // change callback. Keep the target discoverable for that re-entry, then
     // release ownership before any asynchronous write settles or a replacement

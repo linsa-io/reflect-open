@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { call } from './invoke'
+import { call, voidResponseSchema } from './invoke'
 
 const appVersionSchema = z.string()
 
@@ -224,8 +224,6 @@ export async function icloudConflictsScan(options: IcloudScanOptions): Promise<I
     icloudSweepOutcomeSchema,
   )
 }
-
-const voidResponseSchema = z.null()
 
 /**
  * Start the iCloud metadata-query watch over `root` (Plan 21 Phase 2).

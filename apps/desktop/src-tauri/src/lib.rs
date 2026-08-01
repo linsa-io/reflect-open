@@ -18,6 +18,7 @@ mod background_task;
 mod blocking;
 mod calendar;
 mod capture;
+mod collab;
 mod conflict;
 mod contacts;
 mod db;
@@ -235,12 +236,16 @@ pub fn run() {
         .manage(watcher::WatcherState::default())
         .manage(quit::QuitState::default())
         .manage(windows::WindowInit::default())
+        .manage(collab::CollabState::default())
         .manage(embed::EmbedState::default())
         .invoke_handler(tauri::generate_handler![
             app_version,
             app_platform,
             background_task::background_task_begin,
             background_task::background_task_end,
+            collab::collab_join,
+            collab::collab_leave,
+            collab::collab_publish,
             icloud::storage::mobile_storage,
             icloud::storage::mobile_storage_local,
             icloud::storage::icloud_download_pending,
@@ -426,6 +431,10 @@ pub fn run() {
                 if quit.settle(label) {
                     app.exit(0);
                 }
+                // A destroyed window can no longer leave its collab epochs
+                // (unmount effects never ran) — drop its memberships here so
+                // surviving panes see it gone and abandoned epochs die.
+                collab::window_destroyed(app, label);
                 // Note windows adopt the main window's graph session and
                 // degrade silently without it (no indexing, sync, or rename
                 // propagation) — they close with their owner. `close()`, not

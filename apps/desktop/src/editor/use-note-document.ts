@@ -5,6 +5,7 @@ import { createDocumentBinding, type DocumentBinding } from './document-binding'
 import type { NoteEditorHandle } from './note-editor'
 import { createRenameCoordinator } from './rename-coordinator'
 import { createNoteSession, INITIAL_NOTE_SNAPSHOT, type NoteSessionSnapshot } from './note-session'
+import type { NoteSessionCollabState } from './note-session-types'
 import { checkRoundTrip } from './roundtrip'
 
 /**
@@ -26,6 +27,11 @@ export interface NoteDocument extends NoteSessionSnapshot {
   keepMine: () => void
   /** Resolve a conflict by loading the external content (discards the buffer). */
   loadTheirs: () => void
+  /**
+   * Land pending edits now (the collab resume path: un-pausing must persist
+   * the merged buffer without waiting for the next keystroke's debounce).
+   */
+  flush: () => void
   /**
    * Stable identity of the underlying session: increments when a session is
    * *created*, not when a rename retargets one (Plan 17). Key the editor on
@@ -55,6 +61,16 @@ export interface NoteDocumentOptions {
    * for the lazy-contract semantics.
    */
   missingSeed?: string | undefined
+  /**
+   * Forwarded to `NoteSessionOptions.collabState` through a render-written
+   * ref, so a fresh closure per render never recreates the session.
+   */
+  collabState?: (() => NoteSessionCollabState) | undefined
+  /**
+   * Forwarded to `NoteSessionOptions.onBeforeFinalFlush` (the collab layer's
+   * publish-before-final-write hook), through the same ref pattern.
+   */
+  onBeforeFinalFlush?: (() => void) | undefined
 }
 
 /**
@@ -71,6 +87,14 @@ export function useNoteDocument(
   const createIfMissing = options?.createIfMissing ?? false
   const trackRenames = options?.trackRenames ?? false
   const missingSeed = options?.missingSeed
+  // Ref-read like `generationRef`: the session captures these probes at
+  // creation; a changed closure identity must neither lag nor recreate it.
+  const collabStateRef = useRef(options?.collabState)
+  // eslint-disable-next-line react-hooks/refs
+  collabStateRef.current = options?.collabState
+  const beforeFinalFlushRef = useRef(options?.onBeforeFinalFlush)
+  // eslint-disable-next-line react-hooks/refs
+  beforeFinalFlushRef.current = options?.onBeforeFinalFlush
   const [snapshot, setSnapshot] = useState<NoteSessionSnapshot>(INITIAL_NOTE_SNAPSHOT)
   const editorRef = useRef<NoteEditorHandle | null>(null)
   /** Mirrors the snapshot's conflict for non-reactive checks (rename gating). */
@@ -107,7 +131,13 @@ export function useNoteDocument(
           ? createRenameCoordinator({
               path,
               generation: () => generationRef.current,
-              canFire: () => conflictRef.current === null,
+              // Renames hold while the note is shared: every live pane is a
+              // dirty writer, so two coordinators would arm the same title
+              // move and the loser would recreate the old path.
+              canFire: () =>
+                conflictRef.current === null &&
+                !(collabStateRef.current?.().sharedFile ?? false) &&
+                !(collabStateRef.current?.().paused ?? false),
             })
           : null,
       session: (coordinator) =>
@@ -141,6 +171,8 @@ export function useNoteDocument(
           onContent: coordinator ? coordinator.content : undefined,
           createIfMissing,
           missingSeed,
+          collabState: () => collabStateRef.current?.() ?? { paused: false, sharedFile: false },
+          onBeforeFinalFlush: () => beforeFinalFlushRef.current?.(),
         }),
     })
     if (created) {
@@ -219,12 +251,17 @@ export function useNoteDocument(
     binding.session()?.loadTheirs()
   }, [binding])
 
+  const flush = useCallback(() => {
+    void binding.session()?.flush()
+  }, [binding])
+
   return {
     ...snapshot,
     onEditorChange,
     bindEditor,
     keepMine,
     loadTheirs,
+    flush,
     sessionEpoch: binding.epoch(),
   }
 }

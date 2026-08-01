@@ -5,14 +5,19 @@ import { reactWithCompiler } from './react-compiler-plugin'
 export function defineDesktopProject(project: {
   plugins?: ViteUserConfig['plugins']
   test: NonNullable<ViteUserConfig['test']>
+  /** Extra module aliases (e.g. the browser project's loro-crdt wasm pin). */
+  alias?: Record<string, string>
+  optimizeDeps?: ViteUserConfig['optimizeDeps']
 }): ViteUserConfig {
   return defineProject({
     plugins: [reactWithCompiler(), ...(project.plugins ?? [])],
     resolve: {
       alias: {
         '@': fileURLToPath(new URL('./src', import.meta.url)),
+        ...(project.alias ?? {}),
       },
     },
+    ...(project.optimizeDeps ? { optimizeDeps: project.optimizeDeps } : {}),
     test: {
       globals: false,
       maxConcurrency: 1,

@@ -89,7 +89,11 @@ export function retargetOpenDocument(from: string, to: string, session: NoteSess
 export async function flushOpenDocuments(): Promise<void> {
   await Promise.allSettled(
     [...documents.values()].map(async (document) => {
-      await document.session.flush()
+      // Final: quit/close/background teardown must land even a collab-paused
+      // buffer (its unshared ops go to the epoch via the session's
+      // before-final-flush hook) — unmount effects never run on these paths,
+      // so this is the only flush the buffer will ever get.
+      await document.session.flush({ final: true })
       // Settle after the flush so the rename tracker has seen the final title;
       // settle() appends the rewrite synchronously, settled() awaits it.
       document.settle?.()
